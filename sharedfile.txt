@@ -1,0 +1,334 @@
+sudo apt-get install git build-essential gdb-multiarch qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu 
+hexdump -v -e '1/4 "%08x\n"' firmware.bin > firmware_32word.hex
+cd st-image-weston-openstlinux-weston-stm32mp2-openstlinux-25-11-19-debian/images/stm32mp2
+SDCARD_SIZE=16384 ./scripts/create_sdcard_from_flashlayout.sh flashlayout_st-image-weston/optee/FlashLayout_sdcard_stm32mp257f-dk-optee.tsv
+
+| sed 's/[^0-9]*$[0-9]\+$.*/\1/'
+| awk '/score/ {print $NF}'
+
+stty -F /dev/ttyACM0 raw 115200 cs8 -cstopb -parenb -echo -icrnl -onlcr
+bash --login < /dev/ttyACM0 > /dev/ttyACM0
+sudo usermod -a -G dialout $USER
+
+stty -F /dev/ttyACM0 raw -echo -onlcr -ocrnl -opost 115200
+
+make TESTFW=1 test | grep "^[0-9]" | tee -a /dev/ttyACM0
+
+sudo groupadd dialout
+sudo gpasswd -a $USER dialout
+sudo usermod -a -G dialout $USER
+
+sudo nano /etc/udev/rules.d/99-ttyacm.rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", GROUP="dialout", MODE="0666"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", GROUP="serial", MODE="0660"
+sudo udevadm control --reload
+sudo udevadm trigger
+
+sudo chmod 666 /dev/ttyACM0      # everyone can read/write
+sudo chgrp dialout /dev/ttyACM0  # adjust group once
+
+dd if=myfile.bin of=/dev/ttyADCM0 bs=256
+
+
+riscv64-unknown-elf-objdump -d -M no-aliases -M numeric main.elf
+
+
+
+
+        .data
+sieve:  .space 100          # 100 bytes for indices 0..99
+
+    .text
+    .globl main
+
+main:
+    ################################################################
+    # Constants and base addresses (loaded once)
+    ################################################################
+    li   t7, 0x1000         # t7 = base address of sieve
+    li   s10, 0x10000000    # s10 = output MMIO base
+    li   t2, 100            # t2 = 100 (upper bound)
+    li   t6, 10             # t6 = 10  (used in several places)
+
+    ################################################################
+    # 1) Initialize sieve: set all entries to 0
+    ################################################################
+    mv   t0, t7             # t0 = &sieve[0]
+    li   t1, 0              # i = 0
+
+InitZeroLoop:
+    bge  t1, t2, InitOnes   # if i >= 100, stop
+    sb   x0, 0(t0)          # sieve[i] = 0
+    addi t0, t0, 1          # next address
+    addi t1, t1, 1          # i++
+    j    InitZeroLoop
+
+InitOnes:
+    # Set sieve[i] = 1 for i = 2..99
+    addi t0, t7, 2          # t0 = &sieve[2]
+    li   t1, 2              # i = 2
+
+InitOnesLoop:
+    bge  t1, t2, SieveDoneInit
+
+    li   t3, 1
+    sb   t3, 0(t0)          # sieve[i] = 1
+
+    addi t0, t0, 1          # &sieve[i+1]
+    addi t1, t1, 1          # i++
+    j    InitOnesLoop
+
+SieveDoneInit:
+    ################################################################
+    # 2) Sieve of Eratosthenes: mark multiples as not prime
+    ################################################################
+    li   t5, 2              # p = 2
+
+OuterPrimeLoop:
+    bge  t5, t6, PrintPrimes  # stop when p >= 10
+
+    # check if sieve[p] == 1
+    add  t1, t7, t5         # &sieve[p] = base + p
+    lb   t3, 0(t1)          # t3 = sieve[p]
+    beq  t3, x0, NextP      # if not prime, skip
+
+    # k = 2p
+    add  t3, t5, t5         # t3 = k = 2p
+
+MarkMultiplesLoop:
+    bge  t3, t2, NextP      # if k >= 100, break
+
+    add  t1, t7, t3         # &sieve[k]
+    sb   x0, 0(t1)          # sieve[k] = 0
+
+    add  t3, t3, t5         # k += p
+    j    MarkMultiplesLoop
+
+NextP:
+    addi t5, t5, 1          # p++
+    j    OuterPrimeLoop
+
+    ################################################################
+    # 3) Scan sieve and PRINT ONLY PRIMES (2..99)
+    #    No div/mul: keep decimal digits as counters
+    ################################################################
+PrintPrimes:
+    li   s0, 0              # tens digit (0..9)
+    li   s1, 0              # ones digit (0..9)
+    li   s2, 0              # i = 0..99
+
+    # Advance until i == 2, updating decimal digits
+SkipToTwo:
+    li   t0, 2
+    bge  s2, t0, ScanLoop   # if i >= 2, start scanning
+
+    addi s2, s2, 1          # i++
+    addi s1, s1, 1          # ones++
+
+    bne  s1, t6, SkipToTwo  # if ones != 10, loop
+
+    li   s1, 0              # ones = 0
+    addi s0, s0, 1          # tens++
+    j    SkipToTwo
+
+ScanLoop:
+    bge  s2, t2, Done       # if i >= 100, finished
+
+    # check if i is prime: sieve[i] == 1 ?
+    add  t1, t7, s2         # &sieve[i]
+    lb   t3, 0(t1)
+    beq  t3, x0, IncNumber  # not prime, skip print
+
+    # ---- PRINT current prime (two digits) ----
+    # print tens digit: '0' + s0
+    addi a1, s0, 48         # ASCII '0' = 48
+    sb   a1, 0(s10)
+
+    # print ones digit: '0' + s1
+    addi a1, s1, 48
+    sb   a1, 0(s10)
+
+    # newline
+    li   a1, 10             # '\n'
+    sb   a1, 0(s10)
+
+IncNumber:
+    # increment i and its decimal digits by 1
+    addi s2, s2, 1          # i++
+    addi s1, s1, 1          # ones++
+
+    bne  s1, t6, ScanLoop   # if ones != 10, continue
+
+    li   s1, 0              # ones = 0
+    addi s0, s0, 1          # tens++
+    j    ScanLoop
+
+Done:
+    ebreak                  # stop execution
+	
+	
+	
+	
+	
+	-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ --
+	-- ~~~~~~~~~~~~~~~~~~~~~~~ HACHATHON CHALLENGE ~~~~~~~~~~~~~~~~~~~~~~~ --
+	-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ --
+	-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ START ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ --
+        -- instr_lui   <= ... 
+        -- instr_auipc <= ...
+	--
+	-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~END ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ --
+	
+
+
+
+
+
+
+
+
+# Configurable variables - Can be overridden in environment
+TOOLS      = tools
+OUT_DIR   ?= out
+CORE      ?= CORE
+SOURCE    ?= $(shell ls -1 $(CORE)/*.vhd)
+TESTBENCH ?= testbench.vhd
+STOP_TIME ?= 1000us
+
+GHDL      = ghdl
+GHDLFLAGS = --workdir=$(OUT_DIR) --std=08 --ieee=synopsys -fexplicit
+
+GTK       = gtkwave
+GTKFLAGS  = --tcl_init tools/init.tcl --optimize --slider-zoom --wish \
+            --rcvar 'fontname_signals Monospace 13'
+
+#~~~~~~~~~~~ TESTs Obj/Opt Start .. ~~~~~~~~~~~#
+TOOLCHAIN_PREFIX = riscv64-unknown-elf-
+
+TESTISNT_OBJS = $(addsuffix .o,$(basename $(wildcard tests/*.S)))
+TEST_OBJS     = firmware/start.o firmware/print.o firmware/hello.o
+TESTS_OBJS    = $(addsuffix .o,$(basename $(wildcard tests/*.S)))
+TESTALL_OBJS  = firmware/testall.o
+TESTFW_OBJS   = firmware/testfw.o
+
+FULL_CMD = $(TOOLCHAIN_PREFIX)gcc -Os -mabi=ilp32 -march=rv32i -ffreestanding \
+           -nostdlib -Ifirmware \
+           -Wl,--build-id=none,-Bstatic,-T,firmware/sections.lds, \
+           -Map,firmware/test.map,--strip-debug -lgcc
+#~~~~~~~~~~~ TESTs Obj/Opt End .. ~~~~~~~~~~~#
+
+
+# -- ALL --
+all: help
+
+help:
+	@printf "=========================================================== \n"
+	@printf " make help                      : print this message\n"
+	@printf " make all                       : print this message\n"
+	@printf " make TEST=1 test               : run firmware/test.S test\n"
+	@printf " make TESTALL=1 test            : run instructions in tests\n"
+	@printf " make TESTFW=1 test             : run testfw.S test\n"
+	@printf "=========================================================== \n"
+
+
+#==================== Firmware build ====================#
+
+firmware/test.bin: firmware/test.elf
+	$(TOOLCHAIN_PREFIX)objcopy -O binary $< $@
+
+firmware/test.hex: firmware/test.bin
+	@hexdump -v -e '1/4 "%08x\n"' firmware/test.bin > $@
+
+
+# Generic rules for firmware C and ASM → .o
+firmware/%.o: firmware/%.c
+	$(TOOLCHAIN_PREFIX)gcc -Os -mabi=ilp32 -march=rv32i -ffreestanding -nostdlib \
+		-Ifirmware -c -o $@ $<
+
+firmware/%.o: firmware/%.S
+	$(TOOLCHAIN_PREFIX)gcc -Os -mabi=ilp32 -march=rv32i -ffreestanding -nostdlib \
+		-Ifirmware -c -o $@ $<
+
+
+ifdef TEST
+firmware/test.elf: $(TEST_OBJS) firmware/sections.lds
+	@printf "===========================================\n"
+	@printf "Testing using envar  : ${TEST_OBJS}\n"
+	@printf "===========================================\n"
+	$(FULL_CMD) -o $@ $(TEST_OBJS) -lgcc
+	chmod -x $@
+endif
+
+ifdef TESTFW
+firmware/test.elf: $(TESTFW_OBJS) firmware/sections.lds
+	@printf "===========================================\n"
+	@printf "Testing using envar  : ${TESTFW_OBJS}\n"
+	@printf "===========================================\n"
+	$(FULL_CMD) -o $@ $(TESTFW_OBJS)
+	chmod -x $@
+endif
+
+ifdef TESTALL
+tests/%.o: tests/%.S tests/riscv_test.h tests/test_macros.h
+	$(TOOLCHAIN_PREFIX)gcc -Os -mabi=ilp32 -march=rv32i -ffreestanding -nostdlib \
+		-Ifirmware -c -o $@ \
+		-DTEST_FUNC_NAME=$(notdir $(basename $<)) \
+		-DTEST_FUNC_TXT='"$(notdir $(basename $<))"' \
+		-DTEST_FUNC_RET=$(notdir $(basename $<))_ret $<
+
+firmware/test.elf: $(TESTALL_OBJS) $(TESTS_OBJS) firmware/sections.lds
+	@printf "===========================================\n"
+	@printf "Testing using envar  : ${TESTALL_OBJS}\n"
+	@printf "===========================================\n"
+	$(FULL_CMD) -o $@ $(TESTALL_OBJS) $(TESTS_OBJS)
+	chmod -x $@
+endif
+
+
+#==================== VHDL + Simulation ====================#
+
+# All VHDL source and tb
+VHDL_SOURCES   = $(SOURCE) $(TESTBENCH)
+# Use .cf files in OUT_DIR as compilation artifacts
+VHDL_CF        = $(addprefix $(OUT_DIR)/,$(notdir $(VHDL_SOURCES:.vhd=.cf)))
+
+# Top-level test rule:
+#   1) build firmware/test.hex
+#   2) compile VHDL only if changed
+#   3) run simulation to produce VCD
+test: firmware/test.hex wave_$(TESTBENCH:.vhd=.vcd)
+
+gtk:
+	$(GTK) $(GTKFLAGS) wave_$(TESTBENCH:.vhd=.vcd) &
+
+# Ensure workdir exists
+$(OUT_DIR):
+	mkdir -p $(OUT_DIR)
+
+# Compile each VHDL file into OUT_DIR (incremental)
+$(OUT_DIR)/%.cf: %.vhd | $(OUT_DIR)
+	$(GHDL) -a $(GHDLFLAGS) $<
+
+# Elaborate and run testbench, depending on all compiled VHDL
+wave_%.vcd: $(VHDL_CF)
+	# Elaborate
+	$(GHDL) -e $(GHDLFLAGS) $*
+	# Run simulation
+	$(GHDL) -r $(GHDLFLAGS) $* --vcd=$@ #--stop-time=$(STOP_TIME)
+
+
+#==================== CLEAN ====================#
+
+clean:
+	rm -f *.vcd *.fst
+	rm -f *.cf
+	find . -type f -name '*.o' -exec rm -f {} \;
+	rm -f firmware/*.hex firmware/*.elf firmware/*.bin firmware/*.map
+	rm -f wave_*
+	rm -rf $(OUT_DIR)/*
+
+# Optional: only remove VHDL compiled data
+clean_vhdl:
+	rm -f *.vcd *.fst
+	rm -f *.cf
+	rm -rf $(OUT_DIR)/*
